@@ -1,11 +1,7 @@
 """Rate-distortion optimization contracts for a block-based video encoder.
 
-Every public function in this module is intentionally a stub.  The tests in
-``tests/test_optimize.py`` define the observable behaviour; implement these
-functions without changing the tests.
-
 Units and conventions used throughout the module
------------------------------------------------
+------------------------------------------------
 * ``bits`` always means a non-negative integer number of encoded bits (never
   bytes and never a rate normalised per pixel).
 * ``distortion`` is a non-negative sum of squared differences (SSD), in the
@@ -15,163 +11,168 @@ Units and conventions used throughout the module
 * Floating-point comparisons in the tests use a tolerance of ``1e-9``.
 """
 
+import math
+
 VALID_MODES = ("skip", "intra", "inter")
 
 
+def _is_finite_real(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _is_non_negative_int(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
 def ssd(a, b):
-    """Return the sum of squared differences between two equal-length signals.
-
-    Parameters
-    ----------
-    a, b:
-        Non-empty or empty sequences of real numbers with ``len(a) == len(b)``.
-        A length mismatch is a ``ValueError``.
-
-    Returns
-    -------
-    float
-        ``sum((a[i] - b[i]) ** 2 for i in range(len(a)))``.  The result is a
-        plain SSD: it is not normalised, clipped, square-rooted, or replaced by
-        a sum of absolute differences.  An empty input pair returns ``0.0``.
-        The accuracy target for finite inputs is ``1e-9`` absolute/relative.
-    """
-    raise NotImplementedError
+    """Return the sum of squared differences between two equal-length signals."""
+    if len(a) != len(b):
+        raise ValueError("signals must have equal length")
+    return float(sum((x - y) ** 2 for x, y in zip(a, b)))
 
 
 def lambda_for_qp(qp):
     """Map an integer quantiser step to the Lagrangian multiplier.
 
-    The contract is::
-
-        lam = 0.85 * 2 ** ((qp - 12) / 3)
-
-    ``qp`` must be an integer in ``[0, 51]``; anything else raises
-    ``ValueError``.  The result is a positive ``float`` and is strictly
-    increasing in ``qp``.  In particular, increasing QP by 6 multiplies the
-    multiplier by 4 (within the usual ``1e-9`` relative tolerance).
+    ``lam = 0.85 * 2 ** ((qp - 12) / 3)`` for integer ``qp`` in ``[0, 51]``.
     """
-    raise NotImplementedError
+    if isinstance(qp, bool) or not isinstance(qp, int) or not 0 <= qp <= 51:
+        raise ValueError("qp must be an integer in [0, 51]")
+    return 0.85 * 2.0 ** ((qp - 12) / 3.0)
 
 
 def rd_cost(distortion, bits, lam):
-    """Return the rate-distortion cost ``J = D + lam * R``.
+    """Return the rate-distortion cost ``J = D + lam * R``."""
+    if not _is_finite_real(distortion) or distortion < 0:
+        raise ValueError("distortion must be a finite non-negative real")
+    if not _is_non_negative_int(bits):
+        raise ValueError("bits must be a non-negative integer")
+    if not _is_finite_real(lam) or lam <= 0:
+        raise ValueError("lam must be a finite positive real")
+    return float(distortion) + float(lam) * bits
 
-    ``distortion`` must be a finite real number greater than or equal to zero,
-    ``bits`` a finite non-negative integer, and ``lam`` a finite positive real
-    number.  Invalid inputs raise ``ValueError``.  The rate term is multiplied
-    by ``lam``; it is never divided by ``lam``.  Return a ``float`` accurate to
-    ``1e-9``.
-    """
-    raise NotImplementedError
+
+def _check_candidate(candidate):
+    if not hasattr(candidate, "__getitem__"):
+        raise ValueError("candidate must be a mapping")
+    mode = candidate["mode"]
+    if mode not in VALID_MODES:
+        raise ValueError(f"invalid mode: {mode!r}")
+    distortion = candidate["distortion"]
+    if not _is_finite_real(distortion) or distortion < 0:
+        raise ValueError("distortion must be a finite non-negative real")
+    bits = candidate["bits"]
+    if not _is_non_negative_int(bits):
+        raise ValueError("bits must be a non-negative integer")
+    return mode, float(distortion), bits
 
 
 def choose_mode(candidates, lam):
     """Choose the candidate mode with the smallest rate-distortion cost.
 
-    Each candidate is a mapping with at least:
-
-    * ``"mode"``: one of :data:`VALID_MODES`;
-    * ``"distortion"``: finite non-negative SSD;
-    * ``"bits"``: non-negative integer rate.
-
-    The cost of a candidate is ``J = distortion + lam * bits``.  The function
-    returns ``{"mode": <winning mode>, "cost": <winning J>}`` and never returns
-    a candidate object.  Candidates are not required to be sorted by bits or
-    distortion; the input sequence must not be mutated.
-
-    Ties are resolved deterministically by the lexicographically smallest mode
-    name, independently of the input order (for example ``"inter"`` wins a tie
-    with ``"skip"``).  An empty candidate sequence, a duplicate mode, an
-    invalid mode, or malformed fields raise ``ValueError``.  The returned cost
-    is accurate to ``1e-9``.
+    Ties are resolved by the lexicographically smallest mode name,
+    independently of the input order.
     """
-    raise NotImplementedError
+    if not _is_finite_real(lam) or lam <= 0:
+        raise ValueError("lam must be a finite positive real")
+    candidates = list(candidates)
+    if not candidates:
+        raise ValueError("at least one candidate is required")
+    checked = [_check_candidate(candidate) for candidate in candidates]
+    modes = [mode for mode, _, _ in checked]
+    if len(set(modes)) != len(modes):
+        raise ValueError("duplicate modes are not allowed")
+    best_mode, best_cost = min(
+        ((mode, distortion + lam * bits) for mode, distortion, bits in checked),
+        key=lambda item: (item[1], item[0]),
+    )
+    return {"mode": best_mode, "cost": float(best_cost)}
 
 
 def mode_bits(mode, block_size):
-    """Estimate the number of bits needed to code one block in a given mode.
-
-    ``block_size`` is a positive integer number of samples along one side.  Let
-    ``n = ceil(log2(block_size))`` (with ``n = 0`` when ``block_size == 1``).
-    The estimator is:
-
-    * ``"skip"``: ``1`` bit -- the skip flag itself.  A skipped block has no
-      residual and no motion-vector payload, but the flag is still present and
-      must never be estimated as zero.
-    * ``"intra"``: ``4 + 2 * n`` bits -- sublinear in the block area, because
-      prediction and transform headers scale with the log of the block size,
-      not linearly with the number of samples.
-    * ``"inter"``: ``2 + 2 * n`` bits.
-
-    All results are integers.  An unknown mode or a non-positive/non-integer
-    block size raises ``ValueError``.  The caller supplies the rate directly to
-    :func:`rd_cost`; no per-pixel normalisation is performed here.
-    """
-    raise NotImplementedError
+    """Estimate the number of bits needed to code one block in a given mode."""
+    if mode not in VALID_MODES:
+        raise ValueError(f"invalid mode: {mode!r}")
+    if isinstance(block_size, bool) or not isinstance(block_size, int) or block_size <= 0:
+        raise ValueError("block_size must be a positive integer")
+    if mode == "skip":
+        return 1
+    n = math.ceil(math.log2(block_size)) if block_size > 1 else 0
+    if mode == "intra":
+        return 4 + 2 * n
+    return 2 + 2 * n
 
 
 def refine_lambda(cost_curve):
     """Estimate lambda from the slope between two rate-distortion attempts.
 
-    ``cost_curve`` is a sequence of exactly two observations in increasing bit
-    order.  Each observation is a mapping with ``"bits"`` and ``"distortion"``
-    keys.  If the points are ``(R0, D0)`` and ``(R1, D1)``, the estimate is the
-    positive magnitude of the local RD slope::
-
-        lam = (D0 - D1) / (R1 - R0)
-
-    The two rates must differ (strictly increasing), and distortion must
-    strictly decrease from the first observation to the second; otherwise the
-    slope has no valid positive RD interpretation and ``ValueError`` is raised.
-    Return a positive ``float`` with accuracy ``1e-9``.
+    ``lam = (D0 - D1) / (R1 - R0)`` for strictly increasing rates and
+    strictly decreasing distortion.
     """
-    raise NotImplementedError
+    points = list(cost_curve)
+    if len(points) != 2:
+        raise ValueError("cost_curve must contain exactly two observations")
+    r0, d0 = points[0]["bits"], points[0]["distortion"]
+    r1, d1 = points[1]["bits"], points[1]["distortion"]
+    for value in (r0, d0, r1, d1):
+        if not _is_finite_real(value):
+            raise ValueError("bits and distortion must be finite reals")
+    if not r1 > r0:
+        raise ValueError("rates must be strictly increasing")
+    if not d1 < d0:
+        raise ValueError("distortion must strictly decrease")
+    return float((d0 - d1) / (r1 - r0))
 
 
 def validate_candidates(cands):
-    """Return a list of human-readable validation errors for RD candidates.
-
-    An empty list means the candidate set is valid.  The function does not
-    raise for bad candidate contents and does not mutate or reorder ``cands``.
-    Each candidate must be a mapping with a valid ``"mode"``, a finite
-    non-negative ``"distortion"``, and an integer ``"bits"`` that is not
-    negative.
-
-    The rate-distortion points must be monotone: for every pair ``i, j`` with
-    ``bits[i] < bits[j]``, distortion must not increase with the extra rate;
-    that is, ``distortion[i] + 1e-9 >= distortion[j]``.  A pair with more bits
-    and strictly more distortion (outside the ``1e-9`` tolerance) is invalid.
-    Equal-bit candidates are not constrained by this rule.
-    """
-    raise NotImplementedError
+    """Return a list of human-readable validation errors for RD candidates."""
+    errors = []
+    for index, candidate in enumerate(cands):
+        try:
+            _check_candidate(candidate)
+        except (ValueError, KeyError, TypeError) as exc:
+            errors.append(f"candidate {index}: {exc}")
+    checked = []
+    for index, candidate in enumerate(cands):
+        try:
+            checked.append(_check_candidate(candidate))
+        except (ValueError, KeyError, TypeError):
+            continue
+    for i in range(len(checked)):
+        for j in range(len(checked)):
+            _, d_i, b_i = checked[i]
+            _, d_j, b_j = checked[j]
+            if b_i < b_j and d_i + 1e-9 < d_j:
+                errors.append(
+                    f"candidates {i} and {j}: more bits ({b_j} > {b_i}) "
+                    f"but more distortion ({d_j} > {d_i})"
+                )
+    return errors
 
 
 def rd_batch(blocks, config):
-    """Optimise a batch of independent blocks.
+    """Optimise a batch of independent blocks, each with its own lambda."""
+    config = dict(config)
+    allowed_keys = {"lambda_scale"}
+    unknown = set(config) - allowed_keys
+    if unknown:
+        raise ValueError(f"unknown config keys: {sorted(unknown)}")
+    lambda_scale = config.get("lambda_scale", 1.0)
+    if not _is_finite_real(lambda_scale) or lambda_scale <= 0:
+        raise ValueError("lambda_scale must be a finite positive real")
 
-    ``blocks`` is a sequence of mappings with:
-
-    * ``"block_id"``: a string identifier;
-    * ``"qp"``: an integer quantiser in ``[0, 51]``;
-    * ``"candidates"``: a candidate sequence accepted by :func:`choose_mode`.
-
-    ``config`` is a mapping that may contain ``"lambda_scale"`` (a finite
-    positive multiplier applied to each block's base lambda, default ``1.0``).
-    Unknown configuration keys raise ``ValueError``.
-
-    Every block is optimised independently with its own
-    ``lambda_for_qp(block["qp"]) * lambda_scale``.  The returned mapping is::
-
-        {
-            "blocks": [
-                {"block_id": ..., "mode": ..., "cost": ..., "lambda": ...},
-                ...
-            ],
-            "total_cost": <sum of the per-block costs>,
-        }
-
-    Results are in the same order as the input blocks, and one block's QP or
-    lambda must never influence another block.  Per-block values and the total
-    are accurate to ``1e-9``.
-    """
-    raise NotImplementedError
+    results = []
+    total_cost = 0.0
+    for block in blocks:
+        lam = lambda_for_qp(block["qp"]) * lambda_scale
+        chosen = choose_mode(block["candidates"], lam)
+        results.append(
+            {
+                "block_id": block["block_id"],
+                "mode": chosen["mode"],
+                "cost": chosen["cost"],
+                "lambda": lam,
+            }
+        )
+        total_cost += chosen["cost"]
+    return {"blocks": results, "total_cost": float(total_cost)}
